@@ -6,6 +6,7 @@ Analyze AWS CloudTrail logs to detect and report on user/role activity.
 Supports filtering by users, roles, services, and resources.
 """
 
+import concurrent.futures
 import csv
 import gzip
 import io
@@ -14,6 +15,7 @@ import os
 import pathlib
 import random
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -104,6 +106,7 @@ class CacheManager:
         self.base = cache_dir / account_id / region
         self.base.mkdir(parents=True, exist_ok=True)
         self._index: Dict[str, Any] = self._load_index()
+        self._lock = threading.Lock()
 
     # --- index helpers ---
 
@@ -185,12 +188,13 @@ class CacheManager:
         os.replace(str(tmp), str(path))
 
         key = self.hour_key(hour_start)
-        self._index[key] = {
-            "complete": True,
-            "fetched_at": fetched_at,
-            "count": len(events),
-        }
-        self._save_index()
+        with self._lock:
+            self._index[key] = {
+                "complete": True,
+                "fetched_at": fetched_at,
+                "count": len(events),
+            }
+            self._save_index()
 
     def total_size_bytes(self) -> int:
         """Return the total on-disk size of all cached hour files."""
@@ -315,6 +319,7 @@ def build_event_stream(
     end_time: datetime,
     cache_manager: Optional[CacheManager] = None,
     refresh_cache: bool = False,
+    workers: int = 4,
 ) -> Iterator[Dict[str, Any]]:
     """Yield raw CloudTrail events across *[start_time, end_time)*, using the
     local cache for completed past hours and fetching only what is missing.
@@ -331,6 +336,9 @@ def build_event_stream(
 
     When *cache_manager* is ``None`` or *refresh_cache* is ``True`` every hour
     is fetched from AWS.
+
+    Up to *workers* hours are fetched from AWS concurrently, which dramatically
+    reduces wall-clock time for accounts with many events per hour.
     """
     now = datetime.now(tz=timezone.utc)
     current_hour_start = now.replace(minute=0, second=0, microsecond=0)
@@ -350,6 +358,37 @@ def build_event_stream(
     from_cache_count = 0
     from_fetch_count = 0
 
+    def _fetch_or_load(
+        hour_start: datetime,
+    ) -> Tuple[List[Dict[str, Any]], bool, bool]:
+        """Fetch or load events for *hour_start*.
+
+        Returns *(events, from_cache, saved_to_cache)*.
+        """
+        is_current = hour_start >= current_hour_start
+        is_last_completed = hour_start == last_completed_hour_start
+
+        use_cache = (
+            cache_manager is not None
+            and not refresh_cache
+            and not is_current
+            and cache_manager.is_complete(hour_start)
+        )
+        if use_cache and is_last_completed:
+            if cache_manager.is_stale(hour_start):
+                use_cache = False
+
+        if use_cache:
+            return cache_manager.load(hour_start), True, False
+
+        events = fetch_hour(client, hour_start)
+        saved = False
+        if cache_manager is not None and not is_current:
+            cache_manager.save(hour_start, events)
+            saved = True
+        return events, False, saved
+
+    effective_workers = min(workers, len(hours))
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -360,56 +399,44 @@ def build_event_stream(
         transient=False,
     ) as progress:
         task_id = progress.add_task(
-            "Processing CloudTrail hours", total=len(hours)
+            f"Processing CloudTrail hours (workers={effective_workers})",
+            total=len(hours),
         )
 
-        for hour_start in hours:
-            hour_label = hour_start.strftime("%Y-%m-%d %H:%M UTC")
-            is_current = hour_start >= current_hour_start
-            is_last_completed = hour_start == last_completed_hour_start
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=effective_workers
+        ) as executor:
+            # Submit all hours upfront so the thread pool can fetch up to
+            # `effective_workers` hours concurrently.  We consume results in
+            # submission order (to keep event output chronological) by calling
+            # future.result() in sequence.  While we're blocked on future N,
+            # futures N+1 … N+workers are already running in the background,
+            # so total wall-clock time is ~ceil(hours / workers) × single_hour_time.
+            futures = [executor.submit(_fetch_or_load, h) for h in hours]
 
-            # Decide whether to serve this hour from the cache.
-            use_cache = (
-                cache_manager is not None
-                and not refresh_cache
-                and not is_current
-                and cache_manager.is_complete(hour_start)
-            )
-            if use_cache and is_last_completed:
-                # Re-fetch if the cached copy may be missing late-arriving events.
-                if cache_manager.is_stale(hour_start):
-                    use_cache = False
-
-            if use_cache:
-                events = cache_manager.load(hour_start)
+            for hour_start, future in zip(hours, futures):
+                hour_label = hour_start.strftime("%Y-%m-%d %H:%M UTC")
+                events, from_cache, saved = future.result()
                 n = len(events)
-                progress.console.print(
-                    f"  [dim]Loading {hour_label} from cache ({n} events)[/dim]"
-                )
-                from_cache_count += 1
-            else:
-                progress.update(
-                    task_id, description=f"Fetching {hour_label}"
-                )
-                events = fetch_hour(client, hour_start)
-                n = len(events)
-                if cache_manager is not None and not is_current:
-                    cache_manager.save(hour_start, events)
+                if from_cache:
                     progress.console.print(
-                        f"  Fetching {hour_label} … "
-                        f"({n} events) [green]✓ cached[/green]"
+                        f"  [dim]Loading {hour_label} from cache ({n} events)[/dim]"
                     )
+                    from_cache_count += 1
                 else:
-                    progress.console.print(
-                        f"  Fetching {hour_label} … ({n} events)"
-                    )
-                from_fetch_count += 1
+                    if saved:
+                        progress.console.print(
+                            f"  Fetching {hour_label} … "
+                            f"({n} events) [green]✓ cached[/green]"
+                        )
+                    else:
+                        progress.console.print(
+                            f"  Fetching {hour_label} … ({n} events)"
+                        )
+                    from_fetch_count += 1
 
-            progress.update(
-                task_id, description="Processing CloudTrail hours"
-            )
-            progress.advance(task_id)
-            yield from events
+                progress.advance(task_id)
+                yield from events
 
     # Final cache-usage summary.
     total_hours = from_cache_count + from_fetch_count
@@ -889,6 +916,16 @@ def format_as_csv(events: List[Dict[str, Any]]) -> str:
         "(default: ~/.cloudtrail_cache)."
     ),
 )
+@click.option(
+    "--workers",
+    default=4,
+    show_default=True,
+    metavar="N",
+    help=(
+        "Number of hours to fetch from AWS in parallel. "
+        "Increase to speed up initial caching of large time windows."
+    ),
+)
 @click.version_option(version="1.0.0", prog_name="cloudtrail_analysis")
 def main(
     profile: Optional[str],
@@ -910,6 +947,7 @@ def main(
     no_cache: bool,
     refresh_cache: bool,
     cache_dir: Optional[str],
+    workers: int,
 ) -> None:
     """Analyse AWS CloudTrail logs and report on user / role activity.
 
@@ -1030,6 +1068,7 @@ def main(
             end_time=resolved_end,
             cache_manager=cache_manager,
             refresh_cache=refresh_cache,
+            workers=workers,
         )
 
     parsed: List[Dict[str, Any]] = []
