@@ -55,8 +55,6 @@ def get_cloudtrail_client(profile: Optional[str], region: Optional[str]):
         kwargs["region_name"] = region
     try:
         client = session.client("cloudtrail", **kwargs)
-        # Eagerly verify the credentials are usable.
-        client.get_trail_status  # noqa: B018 – attribute access only to validate
         return client
     except botocore.exceptions.ProfileNotFound as exc:
         raise click.ClickException(
