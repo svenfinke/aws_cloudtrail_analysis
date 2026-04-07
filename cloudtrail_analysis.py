@@ -388,6 +388,7 @@ def build_event_stream(
             saved = True
         return events, False, saved
 
+    effective_workers = min(workers, len(hours))
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -398,13 +399,19 @@ def build_event_stream(
         transient=False,
     ) as progress:
         task_id = progress.add_task(
-            "Processing CloudTrail hours", total=len(hours)
+            f"Processing CloudTrail hours (workers={effective_workers})",
+            total=len(hours),
         )
 
-        effective_workers = min(workers, len(hours))
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=effective_workers
         ) as executor:
+            # Submit all hours upfront so the thread pool can fetch up to
+            # `effective_workers` hours concurrently.  We consume results in
+            # submission order (to keep event output chronological) by calling
+            # future.result() in sequence.  While we're blocked on future N,
+            # futures N+1 … N+workers are already running in the background,
+            # so total wall-clock time is ~ceil(hours / workers) × single_hour_time.
             futures = [executor.submit(_fetch_or_load, h) for h in hours]
 
             for hour_start, future in zip(hours, futures):
