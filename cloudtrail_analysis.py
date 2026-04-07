@@ -7,9 +7,14 @@ Supports filtering by users, roles, services, and resources.
 """
 
 import csv
+import gzip
 import io
 import json
+import os
+import pathlib
+import random
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -20,6 +25,14 @@ from rich import box
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 from rich.text import Text
 
@@ -28,6 +41,164 @@ console = Console()
 # status_console writes progress/informational messages to stderr so that
 # JSON/CSV output sent to stdout stays machine-readable.
 status_console = Console(stderr=True)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# CloudTrail throttle error codes that should trigger backoff-and-retry.
+_THROTTLE_CODES = frozenset(
+    {"ThrottlingException", "RateLimitExceededException", "Throttling"}
+)
+
+# Re-fetch the last *completed* hour if the cached copy is older than this.
+_LAST_HOUR_GRACE_MINUTES = 20
+
+# Print a cache-size warning when the on-disk cache exceeds this threshold.
+_CACHE_SIZE_WARN_BYTES = 500 * 1024 * 1024  # 500 MB
+
+
+# ---------------------------------------------------------------------------
+# JSON helpers shared between cache serialisation and output formatters
+# ---------------------------------------------------------------------------
+
+def _json_default(obj: Any) -> str:
+    """JSON serialiser for types not natively supported (e.g. datetime)."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj)} is not JSON serialisable")
+
+
+def _deserialize_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Restore EventTime to a datetime after loading an event from the cache."""
+    et = event.get("EventTime")
+    if isinstance(et, str):
+        try:
+            event["EventTime"] = datetime.fromisoformat(et)
+        except ValueError:
+            pass
+    return event
+
+
+# ---------------------------------------------------------------------------
+# Cache manager
+# ---------------------------------------------------------------------------
+
+class CacheManager:
+    """Manages the local hourly CloudTrail event cache.
+
+    Cache layout::
+
+        <cache_dir>/<account_id>/<region>/
+            index.json          # fast-lookup index: {hour_key: {complete, fetched_at, count}}
+            2024-01-15-09.json.gz   # gzip-compressed JSON envelope for that hour
+            ...
+    """
+
+    def __init__(
+        self,
+        cache_dir: pathlib.Path,
+        account_id: str,
+        region: str,
+    ) -> None:
+        self.base = cache_dir / account_id / region
+        self.base.mkdir(parents=True, exist_ok=True)
+        self._index: Dict[str, Any] = self._load_index()
+
+    # --- index helpers ---
+
+    def _index_path(self) -> pathlib.Path:
+        return self.base / "index.json"
+
+    def _load_index(self) -> Dict[str, Any]:
+        p = self._index_path()
+        if p.exists():
+            try:
+                with p.open(encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {}
+
+    def _save_index(self) -> None:
+        tmp = self._index_path().with_name("index.json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(self._index, f, indent=2)
+        os.replace(str(tmp), str(self._index_path()))
+
+    # --- hour-level helpers ---
+
+    @staticmethod
+    def hour_key(hour_start: datetime) -> str:
+        """Return the string key used to identify a cache entry (e.g. '2024-01-15-09')."""
+        return hour_start.strftime("%Y-%m-%d-%H")
+
+    def hour_path(self, hour_start: datetime) -> pathlib.Path:
+        return self.base / f"{self.hour_key(hour_start)}.json.gz"
+
+    def is_complete(self, hour_start: datetime) -> bool:
+        """Return *True* when the cache entry for *hour_start* is fully written."""
+        return bool(
+            self._index.get(self.hour_key(hour_start), {}).get("complete", False)
+        )
+
+    def is_stale(
+        self, hour_start: datetime, grace_minutes: int = _LAST_HOUR_GRACE_MINUTES
+    ) -> bool:
+        """Return *True* when the cache entry is older than *grace_minutes*.
+
+        Used for the last-completed hour where CloudTrail may still be
+        delivering events up to ~15 minutes after the hour boundary.
+        """
+        entry = self._index.get(self.hour_key(hour_start), {})
+        fetched_at_str = entry.get("fetched_at")
+        if not fetched_at_str:
+            return True
+        fetched_at = datetime.fromisoformat(fetched_at_str)
+        age_seconds = (datetime.now(tz=timezone.utc) - fetched_at).total_seconds()
+        return age_seconds > grace_minutes * 60
+
+    def load(self, hour_start: datetime) -> List[Dict[str, Any]]:
+        """Return the cached events for *hour_start*, or *[]* on any error."""
+        path = self.hour_path(hour_start)
+        if not path.exists():
+            return []
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                data = json.load(f)
+            return [_deserialize_event(e) for e in data.get("events", [])]
+        except (OSError, json.JSONDecodeError, EOFError):
+            return []
+
+    def save(self, hour_start: datetime, events: List[Dict[str, Any]]) -> None:
+        """Atomically write *events* for *hour_start* to the cache."""
+        path = self.hour_path(hour_start)
+        tmp = path.with_name(path.name + ".tmp")
+        fetched_at = datetime.now(tz=timezone.utc).isoformat()
+        envelope: Dict[str, Any] = {
+            "complete": True,
+            "fetched_at": fetched_at,
+            "events": events,
+        }
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            json.dump(envelope, f, default=_json_default)
+        os.replace(str(tmp), str(path))
+
+        key = self.hour_key(hour_start)
+        self._index[key] = {
+            "complete": True,
+            "fetched_at": fetched_at,
+            "count": len(events),
+        }
+        self._save_index()
+
+    def total_size_bytes(self) -> int:
+        """Return the total on-disk size of all cached hour files."""
+        return sum(
+            p.stat().st_size
+            for p in self.base.rglob("*.json.gz")
+            if p.is_file()
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -68,8 +239,196 @@ def get_cloudtrail_client(profile: Optional[str], region: Optional[str]):
         ) from exc
 
 
+def _get_account_id(session: boto3.Session) -> str:
+    """Return the AWS account ID for *session*, or ``'default'`` on failure."""
+    try:
+        return session.client("sts").get_caller_identity()["Account"]
+    except Exception:
+        return "default"
+
+
 # ---------------------------------------------------------------------------
-# Event retrieval
+# Rate-limit-aware fetch helpers
+# ---------------------------------------------------------------------------
+
+def fetch_with_backoff(client, **kwargs: Any) -> Dict[str, Any]:
+    """Call ``client.lookup_events`` with exponential back-off on throttle errors.
+
+    Retries up to 10 times when CloudTrail returns a throttling error.
+    Uses *full jitter* to spread retries across parallel callers.
+    All other ``ClientError`` codes are re-raised immediately as
+    :class:`click.ClickException`.
+    """
+    max_retries = 10
+    base_delay = 1.0
+    max_delay = 60.0
+
+    for attempt in range(max_retries + 1):
+        try:
+            return client.lookup_events(**kwargs)
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            if code not in _THROTTLE_CODES:
+                raise click.ClickException(
+                    f"AWS API error ({code}): {exc}"
+                ) from exc
+            if attempt >= max_retries:
+                raise click.ClickException(
+                    f"AWS rate limit exceeded after {max_retries} retries: {exc}"
+                ) from exc
+            delay = random.uniform(0, min(base_delay * (2 ** attempt), max_delay))
+            status_console.print(
+                f"[yellow]⚠ Rate limited – waiting {delay:.1f}s before retry "
+                f"(attempt {attempt + 1}/{max_retries})[/yellow]"
+            )
+            time.sleep(delay)
+    raise RuntimeError("unreachable")  # pragma: no cover
+
+
+def fetch_hour(client, hour_start: datetime) -> List[Dict[str, Any]]:
+    """Fetch **all** CloudTrail events for the single one-hour window starting
+    at *hour_start* (UTC).
+
+    No ``LookupAttributes`` filter is applied so that the result can be cached
+    once and reused for any combination of client-side filters.
+    """
+    hour_end = hour_start + timedelta(hours=1)
+    request: Dict[str, Any] = {
+        "StartTime": hour_start,
+        "EndTime": hour_end,
+        "MaxResults": 50,
+    }
+    events: List[Dict[str, Any]] = []
+    while True:
+        response = fetch_with_backoff(client, **request)
+        events.extend(response.get("Events", []))
+        next_token = response.get("NextToken")
+        if not next_token:
+            break
+        request["NextToken"] = next_token
+    return events
+
+
+def build_event_stream(
+    client,
+    start_time: datetime,
+    end_time: datetime,
+    cache_manager: Optional[CacheManager] = None,
+    refresh_cache: bool = False,
+) -> Iterator[Dict[str, Any]]:
+    """Yield raw CloudTrail events across *[start_time, end_time)*, using the
+    local cache for completed past hours and fetching only what is missing.
+
+    Hour boundary logic
+    -------------------
+    * **Current hour** (contains ``now``): always re-fetched; never cached
+      (it is still accumulating events).
+    * **Last completed hour**: re-fetched when the cached copy is older than
+      :data:`_LAST_HOUR_GRACE_MINUTES` (CloudTrail can deliver events up to
+      ~15 min after the hour boundary).
+    * **All other past hours**: served from cache when available and complete;
+      fetched from AWS and cached otherwise.
+
+    When *cache_manager* is ``None`` or *refresh_cache* is ``True`` every hour
+    is fetched from AWS.
+    """
+    now = datetime.now(tz=timezone.utc)
+    current_hour_start = now.replace(minute=0, second=0, microsecond=0)
+    last_completed_hour_start = current_hour_start - timedelta(hours=1)
+
+    # Build the ordered list of hour-boundary timestamps within the window.
+    first_hour = start_time.replace(minute=0, second=0, microsecond=0)
+    hours: List[datetime] = []
+    h = first_hour
+    while h < end_time:
+        hours.append(h)
+        h += timedelta(hours=1)
+
+    if not hours:
+        return
+
+    from_cache_count = 0
+    from_fetch_count = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=status_console,
+        transient=False,
+    ) as progress:
+        task_id = progress.add_task(
+            "Processing CloudTrail hours", total=len(hours)
+        )
+
+        for hour_start in hours:
+            hour_label = hour_start.strftime("%Y-%m-%d %H:%M UTC")
+            is_current = hour_start >= current_hour_start
+            is_last_completed = hour_start == last_completed_hour_start
+
+            # Decide whether to serve this hour from the cache.
+            use_cache = (
+                cache_manager is not None
+                and not refresh_cache
+                and not is_current
+                and cache_manager.is_complete(hour_start)
+            )
+            if use_cache and is_last_completed:
+                # Re-fetch if the cached copy may be missing late-arriving events.
+                if cache_manager.is_stale(hour_start):
+                    use_cache = False
+
+            if use_cache:
+                events = cache_manager.load(hour_start)
+                n = len(events)
+                progress.console.print(
+                    f"  [dim]Loading {hour_label} from cache ({n} events)[/dim]"
+                )
+                from_cache_count += 1
+            else:
+                progress.update(
+                    task_id, description=f"Fetching {hour_label}"
+                )
+                events = fetch_hour(client, hour_start)
+                n = len(events)
+                if cache_manager is not None and not is_current:
+                    cache_manager.save(hour_start, events)
+                    progress.console.print(
+                        f"  Fetching {hour_label} … "
+                        f"({n} events) [green]✓ cached[/green]"
+                    )
+                else:
+                    progress.console.print(
+                        f"  Fetching {hour_label} … ({n} events)"
+                    )
+                from_fetch_count += 1
+
+            progress.update(
+                task_id, description="Processing CloudTrail hours"
+            )
+            progress.advance(task_id)
+            yield from events
+
+    # Final cache-usage summary.
+    total_hours = from_cache_count + from_fetch_count
+    if cache_manager is not None and total_hours > 0:
+        status_console.print(
+            f"[dim]Cache summary: {from_cache_count}/{total_hours} hour(s) "
+            f"from cache, {from_fetch_count} freshly fetched.[/dim]"
+        )
+        size = cache_manager.total_size_bytes()
+        if size > _CACHE_SIZE_WARN_BYTES:
+            status_console.print(
+                f"[yellow]Cache size is {size / 1024 / 1024:.0f} MB "
+                f"(>{_CACHE_SIZE_WARN_BYTES // 1024 // 1024} MB). "
+                f"Consider cleaning up {cache_manager.base}[/yellow]"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Event retrieval (used for --no-cache path)
 # ---------------------------------------------------------------------------
 
 def _build_lookup_attributes(
@@ -352,13 +711,7 @@ def render_table(events: List[Dict[str, Any]]) -> None:
 
 def format_as_json(events: List[Dict[str, Any]]) -> str:
     """Serialise events to a JSON string."""
-
-    def default_serialiser(obj: Any) -> str:
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        raise TypeError(f"Object of type {type(obj)} is not JSON serialisable")
-
-    return json.dumps(events, default=default_serialiser, indent=2)
+    return json.dumps(events, default=_json_default, indent=2)
 
 
 _CSV_FIELDS = [
@@ -515,6 +868,27 @@ def format_as_csv(events: List[Dict[str, Any]]) -> str:
     default=False,
     help="Skip the summary panel (useful when piping output).",
 )
+@click.option(
+    "--no-cache",
+    is_flag=True,
+    default=False,
+    help="Bypass the local cache and always fetch directly from CloudTrail.",
+)
+@click.option(
+    "--refresh-cache",
+    is_flag=True,
+    default=False,
+    help="Re-fetch all hours in the requested window and overwrite the cache.",
+)
+@click.option(
+    "--cache-dir",
+    default=None,
+    metavar="PATH",
+    help=(
+        "Directory used for the local CloudTrail event cache "
+        "(default: ~/.cloudtrail_cache)."
+    ),
+)
 @click.version_option(version="1.0.0", prog_name="cloudtrail_analysis")
 def main(
     profile: Optional[str],
@@ -533,6 +907,9 @@ def main(
     output: str,
     output_file: Optional[str],
     no_summary: bool,
+    no_cache: bool,
+    refresh_cache: bool,
+    cache_dir: Optional[str],
 ) -> None:
     """Analyse AWS CloudTrail logs and report on user / role activity.
 
@@ -550,6 +927,10 @@ def main(
 
       # Use an SSO profile and check a specific resource
       cloudtrail_analysis.py --profile my-sso-profile --resource my-s3-bucket
+
+      # Build the local cache for the last 7 days, then reuse it
+      cloudtrail_analysis.py -d 7
+      cloudtrail_analysis.py -d 7 --role deploy --service ec2
     """
     # ------------------------------------------------------------------
     # Resolve time window
@@ -600,29 +981,59 @@ def main(
         highlight=False,
     )
 
+    session = build_session(profile)
     client = get_cloudtrail_client(profile, region)
+
+    # ------------------------------------------------------------------
+    # Set up cache (unless --no-cache was requested)
+    # ------------------------------------------------------------------
+    cache_manager: Optional[CacheManager] = None
+    if not no_cache:
+        resolved_cache_dir = pathlib.Path(
+            cache_dir if cache_dir else pathlib.Path.home() / ".cloudtrail_cache"
+        )
+        account_id = _get_account_id(session)
+        resolved_region = client.meta.region_name or region or "default"
+        cache_manager = CacheManager(resolved_cache_dir, account_id, resolved_region)
+        if refresh_cache:
+            status_console.print(
+                "[yellow]--refresh-cache: ignoring existing cache for this window.[/yellow]"
+            )
 
     # ------------------------------------------------------------------
     # Fetch and filter events
     # ------------------------------------------------------------------
-    # The CloudTrail API supports a single LookupAttribute; we push the most
-    # selective one and apply the remaining filters client-side.
-    primary_username = username  # may be None
-    primary_event_name = event_name[0] if (event_name and not username) else None
-    primary_resource = resource if (resource and not username and not primary_event_name) else None
-
-    raw_events = fetch_events(
-        client,
-        start_time=resolved_start,
-        end_time=resolved_end,
-        username=primary_username,
-        event_name=primary_event_name,
-        resource_name=primary_resource,
-        max_results=max_results,
-    )
+    if no_cache:
+        # Original path: use the most selective LookupAttribute and stream
+        # events directly, respecting --max-results.
+        primary_username = username
+        primary_event_name = event_name[0] if (event_name and not username) else None
+        primary_resource = (
+            resource if (resource and not username and not primary_event_name) else None
+        )
+        raw_event_iter: Iterator[Dict[str, Any]] = fetch_events(
+            client,
+            start_time=resolved_start,
+            end_time=resolved_end,
+            username=primary_username,
+            event_name=primary_event_name,
+            resource_name=primary_resource,
+            max_results=max_results,
+        )
+    else:
+        # Cache path: fetch all events per hour (no server-side filter) so
+        # that cached data is reusable for any combination of client-side
+        # filters.
+        raw_event_iter = build_event_stream(
+            client,
+            start_time=resolved_start,
+            end_time=resolved_end,
+            cache_manager=cache_manager,
+            refresh_cache=refresh_cache,
+        )
 
     parsed: List[Dict[str, Any]] = []
-    for raw in raw_events:
+    for raw in raw_event_iter:
         if not matches_filters(
             raw,
             roles=role if role else None,
@@ -633,6 +1044,8 @@ def main(
         ):
             continue
         parsed.append(parse_event(raw))
+        if max_results is not None and not no_cache and len(parsed) >= max_results:
+            break
 
     # Apply errors-only filter across all output formats
     if errors_only:

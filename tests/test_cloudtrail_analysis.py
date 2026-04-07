@@ -1,8 +1,11 @@
 """Unit tests for cloudtrail_analysis.py."""
 
+import gzip
 import json
-from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+import pathlib
+import time
+from datetime import datetime, timezone, timedelta
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from click.testing import CliRunner
@@ -13,8 +16,15 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cloudtrail_analysis import (
+    CacheManager,
     _build_lookup_attributes,
+    _deserialize_event,
+    _get_account_id,
+    _json_default,
+    build_event_stream,
     fetch_events,
+    fetch_hour,
+    fetch_with_backoff,
     format_as_csv,
     format_as_json,
     main,
@@ -322,7 +332,7 @@ class TestFetchEvents:
 
         client = MagicMock()
         client.lookup_events.side_effect = botocore.exceptions.ClientError(
-            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+            {"Error": {"Code": "AccessDeniedException", "Message": "Access denied"}},
             "LookupEvents",
         )
         start = datetime(2024, 1, 1, tzinfo=timezone.utc)
@@ -363,7 +373,7 @@ class TestCLI:
         mock_get_client.return_value = self._mock_client(events)
 
         runner = CliRunner()
-        result = runner.invoke(main, ["-u", "alice", "-d", "7"])
+        result = runner.invoke(main, ["-u", "alice", "-d", "7", "--no-cache"])
         assert result.exit_code == 0
         assert "RunInstances" in result.output
 
@@ -375,7 +385,7 @@ class TestCLI:
         # mix_stderr=False keeps status messages on stderr separate from the
         # JSON that goes to stdout, so we can parse result.output as JSON.
         runner = CliRunner(mix_stderr=False)
-        result = runner.invoke(main, ["-u", "alice", "--output", "json"])
+        result = runner.invoke(main, ["-u", "alice", "--output", "json", "--no-cache"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert isinstance(data, list)
@@ -387,7 +397,7 @@ class TestCLI:
         mock_get_client.return_value = self._mock_client(events)
 
         runner = CliRunner(mix_stderr=False)
-        result = runner.invoke(main, ["-u", "alice", "--output", "csv"])
+        result = runner.invoke(main, ["-u", "alice", "--output", "csv", "--no-cache"])
         assert result.exit_code == 0
         lines = result.output.strip().splitlines()
         assert lines[0].startswith("EventTime")
@@ -403,7 +413,7 @@ class TestCLI:
 
         runner = CliRunner(mix_stderr=False)
         result = runner.invoke(
-            main, ["-u", "alice", "--write-only", "--output", "json"]
+            main, ["-u", "alice", "--write-only", "--output", "json", "--no-cache"]
         )
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -421,7 +431,7 @@ class TestCLI:
 
         runner = CliRunner(mix_stderr=False)
         result = runner.invoke(
-            main, ["-u", "alice", "--service", "ec2", "--output", "json"]
+            main, ["-u", "alice", "--service", "ec2", "--output", "json", "--no-cache"]
         )
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -440,7 +450,7 @@ class TestCLI:
 
         runner = CliRunner(mix_stderr=False)
         result = runner.invoke(
-            main, ["--role", "github_role", "--output", "json"]
+            main, ["--role", "github_role", "--output", "json", "--no-cache"]
         )
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -458,7 +468,7 @@ class TestCLI:
         # Use JSON output with mix_stderr=False so we can parse clean JSON
         runner = CliRunner(mix_stderr=False)
         result = runner.invoke(
-            main, ["-u", "alice", "--errors-only", "--output", "json"]
+            main, ["-u", "alice", "--errors-only", "--output", "json", "--no-cache"]
         )
         assert result.exit_code == 0
         data = json.loads(result.output)
@@ -477,7 +487,7 @@ class TestCLI:
     def test_no_events_found_message(self, mock_get_client):
         mock_get_client.return_value = self._mock_client([])
         runner = CliRunner()
-        result = runner.invoke(main, ["-u", "alice"])
+        result = runner.invoke(main, ["-u", "alice", "--no-cache"])
         assert result.exit_code == 0
         assert "0" in result.output
 
@@ -490,7 +500,7 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(
             main,
-            ["-u", "alice", "--output", "json", "--output-file", str(out_file)],
+            ["-u", "alice", "--output", "json", "--output-file", str(out_file), "--no-cache"],
         )
         assert result.exit_code == 0
         assert out_file.exists()
@@ -506,9 +516,345 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(
             main,
-            ["-u", "alice", "--output", "csv", "--output-file", str(out_file)],
+            ["-u", "alice", "--output", "csv", "--output-file", str(out_file), "--no-cache"],
         )
         assert result.exit_code == 0
         assert out_file.exists()
         lines = out_file.read_text().strip().splitlines()
         assert lines[0].startswith("EventTime")
+
+
+# ---------------------------------------------------------------------------
+# _json_default and _deserialize_event
+# ---------------------------------------------------------------------------
+
+class TestJsonHelpers:
+    def test_json_default_datetime(self):
+        dt = datetime(2024, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+        result = _json_default(dt)
+        assert "2024-03-01" in result
+
+    def test_json_default_unsupported_type(self):
+        with pytest.raises(TypeError):
+            _json_default(object())
+
+    def test_deserialize_event_converts_string(self):
+        event = {"EventTime": "2024-03-01T12:00:00+00:00", "EventName": "DescribeInstances"}
+        result = _deserialize_event(event)
+        assert isinstance(result["EventTime"], datetime)
+
+    def test_deserialize_event_leaves_datetime_untouched(self):
+        dt = datetime(2024, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+        event = {"EventTime": dt}
+        result = _deserialize_event(event)
+        assert result["EventTime"] is dt
+
+    def test_deserialize_event_handles_bad_string(self):
+        event = {"EventTime": "not-a-date"}
+        # Should not raise; EventTime stays as the original string.
+        result = _deserialize_event(event)
+        assert result["EventTime"] == "not-a-date"
+
+
+# ---------------------------------------------------------------------------
+# CacheManager
+# ---------------------------------------------------------------------------
+
+class TestCacheManager:
+    def _make_cm(self, tmp_path: pathlib.Path) -> CacheManager:
+        return CacheManager(tmp_path, "123456789012", "eu-central-1")
+
+    def _hour(self) -> datetime:
+        return datetime(2024, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
+
+    def test_is_complete_false_for_new_cache(self, tmp_path):
+        cm = self._make_cm(tmp_path)
+        assert not cm.is_complete(self._hour())
+
+    def test_save_and_load_roundtrip(self, tmp_path):
+        cm = self._make_cm(tmp_path)
+        raw = [_make_raw_event()]
+        cm.save(self._hour(), raw)
+        loaded = cm.load(self._hour())
+        assert len(loaded) == 1
+        assert loaded[0]["EventName"] == "DescribeInstances"
+
+    def test_save_restores_event_time_as_datetime(self, tmp_path):
+        cm = self._make_cm(tmp_path)
+        raw = [_make_raw_event()]
+        cm.save(self._hour(), raw)
+        loaded = cm.load(self._hour())
+        assert isinstance(loaded[0]["EventTime"], datetime)
+
+    def test_is_complete_true_after_save(self, tmp_path):
+        cm = self._make_cm(tmp_path)
+        cm.save(self._hour(), [_make_raw_event()])
+        assert cm.is_complete(self._hour())
+
+    def test_is_stale_true_for_uncached_hour(self, tmp_path):
+        cm = self._make_cm(tmp_path)
+        assert cm.is_stale(self._hour())
+
+    def test_is_stale_false_immediately_after_save(self, tmp_path):
+        cm = self._make_cm(tmp_path)
+        cm.save(self._hour(), [_make_raw_event()])
+        assert not cm.is_stale(self._hour(), grace_minutes=20)
+
+    def test_is_stale_true_when_grace_period_elapsed(self, tmp_path):
+        cm = self._make_cm(tmp_path)
+        cm.save(self._hour(), [_make_raw_event()])
+        # Overwrite fetched_at with a timestamp 21 minutes in the past.
+        key = cm.hour_key(self._hour())
+        old_time = (
+            datetime.now(tz=timezone.utc) - timedelta(minutes=21)
+        ).isoformat()
+        cm._index[key]["fetched_at"] = old_time
+        cm._save_index()
+        # Reload index.
+        cm2 = self._make_cm(tmp_path)
+        assert cm2.is_stale(self._hour(), grace_minutes=20)
+
+    def test_atomic_write_no_partial_file_on_intact_save(self, tmp_path):
+        cm = self._make_cm(tmp_path)
+        cm.save(self._hour(), [_make_raw_event()])
+        tmp_file = cm.hour_path(self._hour()).with_name(
+            cm.hour_path(self._hour()).name + ".tmp"
+        )
+        assert not tmp_file.exists()
+        assert cm.hour_path(self._hour()).exists()
+
+    def test_load_returns_empty_list_for_missing_file(self, tmp_path):
+        cm = self._make_cm(tmp_path)
+        assert cm.load(self._hour()) == []
+
+    def test_load_returns_empty_list_for_corrupt_file(self, tmp_path):
+        cm = self._make_cm(tmp_path)
+        path = cm.hour_path(self._hour())
+        path.write_bytes(b"not gzip data")
+        assert cm.load(self._hour()) == []
+
+    def test_total_size_bytes_nonzero_after_save(self, tmp_path):
+        cm = self._make_cm(tmp_path)
+        cm.save(self._hour(), [_make_raw_event()])
+        assert cm.total_size_bytes() > 0
+
+    def test_index_persists_across_instances(self, tmp_path):
+        cm1 = self._make_cm(tmp_path)
+        cm1.save(self._hour(), [_make_raw_event()])
+        cm2 = self._make_cm(tmp_path)
+        assert cm2.is_complete(self._hour())
+
+    def test_hour_key_format(self, tmp_path):
+        cm = self._make_cm(tmp_path)
+        assert cm.hour_key(self._hour()) == "2024-03-01-09"
+
+
+# ---------------------------------------------------------------------------
+# fetch_with_backoff
+# ---------------------------------------------------------------------------
+
+class TestFetchWithBackoff:
+    def test_returns_response_on_success(self):
+        client = MagicMock()
+        client.lookup_events.return_value = {"Events": []}
+        result = fetch_with_backoff(client, StartTime="x", EndTime="y")
+        assert result == {"Events": []}
+
+    def test_raises_click_exception_on_non_throttle_error(self):
+        import botocore.exceptions
+        import click
+
+        client = MagicMock()
+        client.lookup_events.side_effect = botocore.exceptions.ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "Denied"}},
+            "LookupEvents",
+        )
+        with pytest.raises(click.ClickException):
+            fetch_with_backoff(client)
+
+    def test_retries_on_throttle_then_succeeds(self):
+        import botocore.exceptions
+
+        client = MagicMock()
+        throttle_exc = botocore.exceptions.ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+            "LookupEvents",
+        )
+        client.lookup_events.side_effect = [throttle_exc, {"Events": [_make_raw_event()]}]
+        with patch("cloudtrail_analysis.time.sleep"):
+            result = fetch_with_backoff(client)
+        assert len(result["Events"]) == 1
+        assert client.lookup_events.call_count == 2
+
+    def test_raises_after_max_retries(self):
+        import botocore.exceptions
+        import click
+
+        client = MagicMock()
+        throttle_exc = botocore.exceptions.ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+            "LookupEvents",
+        )
+        client.lookup_events.side_effect = throttle_exc
+        with patch("cloudtrail_analysis.time.sleep"):
+            with pytest.raises(click.ClickException):
+                fetch_with_backoff(client)
+
+
+# ---------------------------------------------------------------------------
+# fetch_hour
+# ---------------------------------------------------------------------------
+
+class TestFetchHour:
+    def _make_client(self, pages):
+        client = MagicMock()
+        responses = []
+        for i, page in enumerate(pages):
+            resp = {"Events": page}
+            if i < len(pages) - 1:
+                resp["NextToken"] = f"token-{i}"
+            responses.append(resp)
+        client.lookup_events.side_effect = responses
+        return client
+
+    def test_single_page(self):
+        hour = datetime(2024, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
+        client = self._make_client([[_make_raw_event()]])
+        events = fetch_hour(client, hour)
+        assert len(events) == 1
+
+    def test_multi_page(self):
+        hour = datetime(2024, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
+        client = self._make_client([[_make_raw_event()] * 50, [_make_raw_event()] * 10])
+        events = fetch_hour(client, hour)
+        assert len(events) == 60
+
+    def test_correct_time_window_sent(self):
+        hour = datetime(2024, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
+        client = self._make_client([[]])
+        fetch_hour(client, hour)
+        kwargs = client.lookup_events.call_args[1]
+        assert kwargs["StartTime"] == hour
+        assert kwargs["EndTime"] == hour + timedelta(hours=1)
+
+    def test_no_lookup_attributes(self):
+        hour = datetime(2024, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
+        client = self._make_client([[]])
+        fetch_hour(client, hour)
+        kwargs = client.lookup_events.call_args[1]
+        assert "LookupAttributes" not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# build_event_stream
+# ---------------------------------------------------------------------------
+
+class TestBuildEventStream:
+    def _make_client(self, events_per_call=None):
+        client = MagicMock()
+        if events_per_call is None:
+            client.lookup_events.return_value = {"Events": []}
+        else:
+            client.lookup_events.side_effect = [
+                {"Events": evts} for evts in events_per_call
+            ]
+        return client
+
+    def test_yields_events_from_aws_when_no_cache(self):
+        hour = datetime(2024, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
+        client = self._make_client(
+            events_per_call=[[_make_raw_event()], [_make_raw_event()]]
+        )
+        start = hour
+        end = hour + timedelta(hours=2)
+        events = list(build_event_stream(client, start, end, cache_manager=None))
+        assert len(events) == 2
+
+    def test_loads_from_cache_when_complete(self, tmp_path):
+        hour = datetime(2024, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
+        cm = CacheManager(tmp_path, "123456789012", "eu-central-1")
+        cm.save(hour, [_make_raw_event(), _make_raw_event()])
+        client = self._make_client()  # should NOT be called for this hour
+        start = hour
+        end = hour + timedelta(hours=1)
+        events = list(build_event_stream(client, start, end, cache_manager=cm))
+        assert len(events) == 2
+        client.lookup_events.assert_not_called()
+
+    def test_fetches_and_caches_missing_hour(self, tmp_path):
+        hour = datetime(2024, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
+        cm = CacheManager(tmp_path, "123456789012", "eu-central-1")
+        client = self._make_client(events_per_call=[[_make_raw_event()]])
+        start = hour
+        end = hour + timedelta(hours=1)
+        list(build_event_stream(client, start, end, cache_manager=cm))
+        assert cm.is_complete(hour)
+
+    def test_refresh_cache_ignores_existing_entries(self, tmp_path):
+        hour = datetime(2024, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
+        cm = CacheManager(tmp_path, "123456789012", "eu-central-1")
+        # Pre-populate cache.
+        cm.save(hour, [_make_raw_event(event_name="OldEvent")])
+        # Fetch returns a different event.
+        client = self._make_client(events_per_call=[[_make_raw_event(event_name="NewEvent")]])
+        start = hour
+        end = hour + timedelta(hours=1)
+        events = list(
+            build_event_stream(client, start, end, cache_manager=cm, refresh_cache=True)
+        )
+        assert events[0]["EventName"] == "NewEvent"
+        client.lookup_events.assert_called()
+
+    def test_empty_window_yields_nothing(self):
+        now = datetime(2024, 3, 1, 9, 30, 0, tzinfo=timezone.utc)
+        client = self._make_client()
+        events = list(build_event_stream(client, now, now, cache_manager=None))
+        assert events == []
+
+
+# ---------------------------------------------------------------------------
+# CLI integration tests: cache path (default)
+# ---------------------------------------------------------------------------
+
+class TestCLIWithCache:
+    """Integration tests that exercise the default cache code path."""
+
+    def _mock_client(self, events):
+        client = MagicMock()
+        client.lookup_events.return_value = {"Events": events}
+        client.meta.region_name = "eu-central-1"
+        return client
+
+    @patch("cloudtrail_analysis.get_cloudtrail_client")
+    @patch("cloudtrail_analysis.build_session")
+    def test_cache_path_returns_events(self, mock_session, mock_get_client, tmp_path):
+        events = [_make_raw_event(username="alice", event_name="RunInstances")]
+        mock_get_client.return_value = self._mock_client(events)
+        mock_session.return_value.client.return_value.get_caller_identity.return_value = {
+            "Account": "123456789012"
+        }
+
+        runner = CliRunner(mix_stderr=False)
+        result = runner.invoke(
+            main,
+            ["-u", "alice", "-d", "1", "--output", "json", "--cache-dir", str(tmp_path)],
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert any(e["EventName"] == "RunInstances" for e in data)
+
+    @patch("cloudtrail_analysis.get_cloudtrail_client")
+    @patch("cloudtrail_analysis.build_session")
+    def test_refresh_cache_flag_accepted(self, mock_session, mock_get_client, tmp_path):
+        mock_get_client.return_value = self._mock_client([])
+        mock_session.return_value.client.return_value.get_caller_identity.return_value = {
+            "Account": "123456789012"
+        }
+
+        runner = CliRunner(mix_stderr=False)
+        result = runner.invoke(
+            main,
+            ["-d", "1", "--refresh-cache", "--cache-dir", str(tmp_path)],
+        )
+        assert result.exit_code == 0
+
